@@ -1,0 +1,1131 @@
+---
+title: "Modeling Power Plant Energy Output Using Non-linear Regression"
+---
+
+STW7089CEM - Introduction to Statistical Methods for Data Science
+
+------------------------------------------------------------------------
+
+Control Flags
+
+-   Boolean value to decide if data should be cleaned before processing (e.g., NA, '', Non-numeric, Missing Values)
+
+```{r}
+SHOULD_CLEAN_DATA <- TRUE
+```
+
+-   Boolean value to decide if outliers should be removed (e.g., based on IQR after initial cleaning)
+
+```{r}
+REMOVE_OUTLIERS <- TRUE
+```
+
+-   Boolean value to decide if predictor variables should be standardized (centered and scaled) before model fitting in Task 2 and Task 3.
+
+```{r}
+SHOULD_STANDARDIZE_PREDICTORS <- TRUE
+```
+
+Install necessary packages if not installed
+
+```{r}
+if (!requireNamespace("corrplot")) install.packages("corrplot")
+if (!requireNamespace("rsample")) install.packages("rsample")
+if (!requireNamespace("car")) install.packages("car")
+if (!requireNamespace("GGally")) install.packages("GGally")
+if (!requireNamespace("ggplot2")) install.packages("ggplot2")
+if (!requireNamespace("tidyr")) install.packages("tidyr")
+if (!requireNamespace("MASS")) install.packages("MASS")
+if (!requireNamespace("patchwork")) install.packages("patchwork") 
+
+library(corrplot)
+library(GGally)
+library(rsample)
+library(car)
+library(ggplot2)
+library(tidyr)
+library(MASS)
+library(patchwork)
+```
+
+Load and Prepare data
+
+```{r}
+set.seed(123) # Global seed
+
+full_data_raw <- read.csv("dataset.csv", header = TRUE, stringsAsFactors = FALSE)
+cat("Raw data loaded. Dimensions:", nrow(full_data_raw), "rows,", ncol(full_data_raw), "cols.\n")
+```
+
+Rename columns based on problem description mapping
+
+<!-- CSV header: x1, x3, x4, x5, x2 -->
+
+<!-- Names: -->
+
+<!-- x1 -> temp_T -->
+
+<!-- x3 -> pressure_AP -->
+
+<!-- x4 -> humidity_RH -->
+
+<!-- x5 -> vacuum_V -->
+
+<!-- x2 -> energy_EP (Y - dependent variable) -->
+
+```{r}
+df <- data.frame(
+  temp_T      = as.numeric(as.character(full_data_raw$x1)),
+  pressure_AP = as.numeric(as.character(full_data_raw$x3)),
+  humidity_RH = as.numeric(as.character(full_data_raw$x4)),
+  vacuum_V    = as.numeric(as.character(full_data_raw$x5)),
+  energy_EP   = as.numeric(as.character(full_data_raw$x2))
+)
+print(head(df)) 
+```
+
+Converted columns to numeric. Original column names from CSV were x1,x3,x4,x5,x2.
+
+These have been mapped to temp_T, pressure_AP, humidity_RH, vacuum_V, and energy_EP respectively.
+
+Set original row count
+
+```{r}
+original_row_count <- nrow(df)
+```
+
+Clean data if SHOULD_CLEAN_DATA is TRUE
+
+```{r}
+if (SHOULD_CLEAN_DATA) {
+  cat("Initial Data Cleaning Activated (Handling Invalid/Missing Values)\n")
+  na_rows_mask <- !complete.cases(df)
+  num_na_rows <- sum(na_rows_mask)
+
+  if (num_na_rows > 0) {
+    cat("NA counts per column before removal:\n"); print(colSums(is.na(df)))
+    df <- df[complete.cases(df), ]
+    cat(num_na_rows, "rows with invalid or missing values removed. New dimensions:", nrow(df), "rows.\n")
+  } else {
+    cat("No invalid (non-numeric or missing) values found to remove.\n")
+  }
+} else {
+  cat("Initial Data Cleaning Skipped.\n")
+  # If not cleaning, still important to check for NAs as models will fail
+  if (any(is.na(df))) {
+    cat("Warning: SHOULD_CLEAN_DATA is FALSE, but NAs exist. Models may fail. Consider enabling cleaning.\n")
+  }
+}
+cat("Total rows removed by initial cleaning:", original_row_count - nrow(df), "\n")
+```
+
+Remove outliers if REMOVE_OUTLIERS is TRUE
+
+```{r}
+rows_removed_by_outliers <- 0
+if (REMOVE_OUTLIERS) {
+  cat("Statistical Outlier Removal Activated (IQR Method)\n")
+  data_before_outlier_removal <- df
+
+  for (col_name in colnames(df)) {
+    if (is.numeric(df[[col_name]])) {
+      rows_before_col_filter <- nrow(df)
+      Q1 <- quantile(df[[col_name]], 0.25, na.rm = TRUE)
+      Q3 <- quantile(df[[col_name]], 0.75, na.rm = TRUE)
+      IQR_val <- Q3 - Q1
+      lower_bound <- Q1 - 1.5 * IQR_val
+      upper_bound <- Q3 + 1.5 * IQR_val
+
+      outliers_in_col_mask <- df[[col_name]] < lower_bound | df[[col_name]] > upper_bound
+      outliers_in_col_mask[is.na(outliers_in_col_mask)] <- FALSE # Ensure NAs in mask are FALSE
+      num_outliers_in_col <- sum(outliers_in_col_mask)
+
+      if(num_outliers_in_col > 0) {
+        df <- df[!outliers_in_col_mask, ]
+        cat("For column '", col_name, "': identified ", num_outliers_in_col, " outliers. Lower:", round(lower_bound,2), " Upper:", round(upper_bound,2), ". Rows removed related to this column's outliers: ", rows_before_col_filter - nrow(df), ". New df rows: ", nrow(df), "\n", sep="")
+      }
+    }
+  }
+  rows_removed_by_outliers <- nrow(data_before_outlier_removal) - nrow(df)
+  cat("Total rows removed due to outliers (overall):", rows_removed_by_outliers, "\n")
+  cat("Data dimensions after outlier removal:", nrow(df), "x", ncol(df), "\n")
+  if (nrow(df) < 20) { # Increased minimum threshold slightly for robustness in later stages
+    stop("Too few data points remaining after outlier removal (less than 20). Check outlier logic, data, or consider not removing outliers.")
+  }
+} else {
+  cat("Statistical Outlier Removal Skipped.\n")
+}
+```
+
+Prepare X (features) and Y (target) for modeling tasks
+
+Ensure df has enough rows after all processing steps
+
+```{r}
+if(nrow(df) < 5) { # Minimum for any kind of regression
+  stop("Not enough data to proceed after cleaning and/or outlier removal for modeling.")
+}
+
+X_df <- df[, c("temp_T", "pressure_AP", "humidity_RH", "vacuum_V")]
+Y_vec <- df$energy_EP
+X_matrix <- as.matrix(X_df) # Original predictors matrix
+Y_matrix <- as.matrix(Y_vec) # Target variable as matrix
+
+cat("Summary of final processed data for analysis:\n")
+summary(df)
+```
+
+# Task 1: Preliminary Data Analysis
+
+## Task 1.1: Time series plots (of input and output signal)
+
+```{r}
+df_plot_gg <- df
+df_plot_gg$Index <- 1:nrow(df_plot_gg)
+variables_to_plot_ts <- setdiff(colnames(df_plot_gg), "Index") # Get variable names from df
+
+for (var_name in variables_to_plot_ts) {
+  p <- ggplot(df_plot_gg, aes(x = Index, y = .data[[var_name]])) +
+    geom_line(color = "steelblue", alpha = 0.8) +
+    labs(title = paste("Full Time Series of", var_name),
+         subtitle = "Note: Index is data order, not true time as data may be shuffled.",
+         x = "Index (Time Proxy)",
+         y = var_name) +
+    theme_light() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size=14),
+          plot.subtitle = element_text(hjust = 0.5, size=10),
+          axis.title = element_text(size=12))
+  print(p)
+}
+
+frame_limits <- list(
+  Frame1 = c(1, 100),
+  Frame2 = c(101, 200),
+  Frame3 = c(201, 300)
+)
+
+current_n_rows <- nrow(df_plot_gg)
+
+for (var_name in variables_to_plot_ts) {
+  cat("\n--- Framed Time Series Plots for:", var_name, "---\n")
+  for (frame_name in names(frame_limits)) {
+    start_idx <- frame_limits[[frame_name]][1]
+    end_idx <- frame_limits[[frame_name]][2]
+
+    # Adjust end_idx if it exceeds the number of rows
+    actual_end_idx <- min(end_idx, current_n_rows)
+
+    if (start_idx <= current_n_rows) {
+      # Ensure start_idx is not greater than actual_end_idx (e.g. if current_n_rows is small)
+      actual_start_idx <- min(start_idx, actual_end_idx)
+      
+      subset_df <- df_plot_gg[actual_start_idx:actual_end_idx, ]
+      
+      if (nrow(subset_df) > 1) { # Need at least 2 points to draw a line
+        p_frame <- ggplot(subset_df, aes(x = Index, y = .data[[var_name]])) +
+          geom_line(color = "darkorange", alpha = 0.9) +
+          geom_point(color = "darkorange", size = 1, alpha = 0.7) + # Add points for clarity in shorter series
+          labs(title = paste(frame_name, "Time Series of", var_name, "(Indices:", actual_start_idx, "-", actual_end_idx, ")"),
+               x = "Index (Time Proxy)",
+               y = var_name) +
+          theme_light() +
+          theme(plot.title = element_text(hjust = 0.5, face = "bold", size=12),
+                axis.title = element_text(size=10))
+        print(p_frame)
+      } else {
+        cat("Not enough data points in", frame_name, "(Indices:", actual_start_idx, "-", actual_end_idx, ") for", var_name, "to plot a line.\n")
+      }
+    } else {
+      cat(frame_name, "for", var_name, "is beyond the data length (", current_n_rows, "rows). Skipping.\n")
+      break # Stop trying further frames for this variable if start_idx is already too high
+    }
+  }
+}
+```
+
+## Task 1.2: Distribution for each signal
+
+```{r}
+variables_to_plot_dist <- colnames(df) # All variables in the processed df
+
+for (var_name in variables_to_plot_dist) {
+  p_dist <- ggplot(df, aes(x = .data[[var_name]])) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "lightblue", color = "black", alpha = 0.7, na.rm = TRUE) +
+    geom_density(aes(y = after_stat(density)), color = "red", linewidth = 1, na.rm = TRUE, bw = "nrd0") +
+    labs(title = paste("Distribution of", var_name), 
+         x = var_name, 
+         y = "Density") +
+    theme_light() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size=14),
+          axis.title = element_text(size=12))
+  print(p_dist)
+}
+```
+
+## Task 1.3: Correlation and scatter plots
+
+```{r}
+# Correlation Matrix
+if (nrow(df) > ncol(df) && nrow(df) > 1) { # Ensure more rows than columns and at least 2 rows
+  cor_matrix <- cor(df, use = "pairwise.complete.obs") # Handles NAs by pairwise deletion
+  cat("Correlation Matrix:\n")
+  print(round(cor_matrix, 3))
+  corrplot(cor_matrix, method="number", type="upper", order="hclust",
+           tl.col="black", tl.srt=45, title="Correlation Heatmap of Variables", mar=c(0,0,1.5,0))
+} else {
+  cat("Not enough data rows relative to columns (or <2 rows) to compute a meaningful correlation matrix.\n")
+}
+```
+
+Scatter Plots (Input vs. Output with lowess line)
+
+```{r}
+predictor_vars <- colnames(X_df) # temp_T, pressure_AP, humidity_RH, vacuum_V
+
+for (pred_var in predictor_vars) {
+  # Create a temporary data frame for plotting each scatter plot
+  # Ensure consistent lengths after potential NA removals earlier
+  temp_plot_df <- data.frame(Predictor_Value = df[[pred_var]], energy_EP = df$energy_EP)
+  
+  p_scatter <- ggplot(temp_plot_df, aes(x = Predictor_Value, y = energy_EP)) +
+    geom_point(alpha = 0.2, color = "blue", size = 1.0, na.rm=TRUE) +
+    geom_smooth(method = "loess", formula = y ~ x, se = FALSE, color = "red", linewidth = 1, span=0.6, na.rm=TRUE) +
+    labs(title = paste("Energy Output (EP) vs.", pred_var),
+         x = pred_var,
+         y = "Energy Output (EP)") +
+    theme_light() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size=14),
+          axis.title = element_text(size=12))
+  print(p_scatter)
+}
+```
+
+Scatter Plot Matrix (using GGally for a more comprehensive view)
+
+```{r}
+if (nrow(df) > ncol(df) && nrow(df) > 1) { # Basic check for plottable data
+    if (nrow(df) > 1000) {
+      df_sample_ggpairs <- df[sample(nrow(df), 1000), ] # Sample if data is large
+      ggpairs_plot <- ggpairs(df_sample_ggpairs, title="Scatter Plot Matrix (Sampled Data - 1000 points)")
+      print(ggpairs_plot)
+    } else {
+      ggpairs_plot <- ggpairs(df, title="Scatter Plot Matrix (Full Processed Data)")
+      print(ggpairs_plot)
+    }
+} else {
+  cat("Not enough data for ggpairs after processing.\n")
+}
+```
+
+## Task 1 (Extended): Simple Multivariate Linear Model Fit
+
+```{r}
+if (nrow(df) > (ncol(X_df) + 1)) { # Ensure enough data for model fitting
+  simple_lm <- lm(energy_EP ~ temp_T + pressure_AP + humidity_RH + vacuum_V, data = df)
+  cat("Summary of Simple Linear Model:\n")
+  print(summary(simple_lm))
+  cat("\nOutlier/Influence diagnostics for simple linear model:\n")
+  tryCatch({ # car::outlierTest can fail if model is degenerate
+      print(car::outlierTest(simple_lm))
+  }, error = function(e) {
+      cat("Could not perform outlierTest:", e$message, "\n")
+  })
+
+  tryCatch({
+    cooksd <- cooks.distance(simple_lm)
+    if(all(is.na(cooksd))) stop("Cook's distances are all NA.")
+    
+    cooksd_df <- data.frame(Index = 1:length(cooksd), CooksD = cooksd)
+    
+    # Identify top 3 influential points for labeling, ensuring indices are valid
+    valid_cooks_indices <- which(!is.na(cooksd))
+    # Ensure we don't try to sample more than available valid points
+    num_labels <- min(3, length(valid_cooks_indices)) 
+    top_n_cooks_indices <- if(num_labels > 0) {
+        order(cooksd[valid_cooks_indices], decreasing = TRUE)[1:num_labels]
+    } else { integer(0) }
+    
+    # Map back to original indices if sampling was from valid_cooks_indices
+    label_indices_in_cooksd_df <- if(num_labels > 0) valid_cooks_indices[top_n_cooks_indices] else integer(0)
+
+    cutoff_cooks_simple <- 4 / (nrow(df) - length(coef(simple_lm))) # Standard cutoff
+
+    p_cooksd <- ggplot(cooksd_df, aes(x = Index, y = CooksD)) +
+      geom_segment(aes(xend = Index, yend = 0), color="grey70", linewidth=0.5, na.rm=TRUE) +
+      geom_point(shape=21, fill="skyblue", color="black", size=2, na.rm=TRUE) +
+      geom_hline(yintercept = cutoff_cooks_simple, color = "red", linetype = "dashed", linewidth = 0.8) +
+      labs(title = "Cook's Distance - Simple Linear Model",
+           subtitle = paste("Cutoff (4/(n-p)):", round(cutoff_cooks_simple,4)),
+           x = "Observation Index", y = "Cook's Distance") +
+      theme_light() +
+      theme(plot.title = element_text(hjust = 0.5, face="bold"),
+            plot.subtitle = element_text(hjust = 0.5))
+    
+    # Add labels only if there are points to label
+    if(length(label_indices_in_cooksd_df) > 0) {
+        p_cooksd <- p_cooksd + geom_text(data = cooksd_df[label_indices_in_cooksd_df, ], aes(label = Index), vjust = -0.8, size=3, color="red", na.rm=TRUE)
+    }
+    print(p_cooksd)
+  }, error = function(e) {
+      cat("Could not plot Cook's distances:", e$message, "\n")
+  })
+} else {
+  cat("Not enough data points after processing to fit the simple linear model.\n")
+}
+```
+
+# Task 2: Regression Modeling
+
+```{r}
+N_model <- nrow(df) # Number of observations from final processed data
+if (N_model < max(5, ncol(X_df)+2) ) { # X_df has 4 cols, so ncol(X_df)+2 = 6. Max(5,6)=6. Need at least 6 points.
+  stop("Too few data points to proceed with Task 2 modeling after all processing steps.")
+}
+ones_col <- matrix(1, nrow = N_model, ncol = 1)
+```
+
+## Task 2.1: Estimate model parameters (theta_hat) using Least Squares
+
+```{r}
+# Constructing feature matrices for each model based on the original X_matrix (unscaled at this point)
+# X_matrix contains: temp_T, pressure_AP, humidity_RH, vacuum_V
+X_m1_raw_df <- data.frame(humidity_RH = X_matrix[,"humidity_RH"], pressure_AP_sq = X_matrix[,"pressure_AP"]^2)
+X_m2_raw_df <- data.frame(humidity_RH = X_matrix[,"humidity_RH"], pressure_AP_sq = X_matrix[,"pressure_AP"]^2, vacuum_V = X_matrix[,"vacuum_V"])
+X_m3_raw_df <- data.frame(pressure_AP = X_matrix[,"pressure_AP"], humidity_RH = X_matrix[,"humidity_RH"], vacuum_V_cubed = X_matrix[,"vacuum_V"]^3) # Note: Model 3 uses V^3
+X_m4_raw_df <- data.frame(humidity_RH = X_matrix[,"humidity_RH"], pressure_AP_sq = X_matrix[,"pressure_AP"]^2, vacuum_V_cubed = X_matrix[,"vacuum_V"]^3) # Model 4 uses V^3
+X_m5_raw_df <- data.frame(humidity_RH = X_matrix[,"humidity_RH"], temp_T_sq = X_matrix[,"temp_T"]^2, pressure_AP_sq = X_matrix[,"pressure_AP"]^2)
+
+model_raw_predictors_dfs_list <- list(
+  Model1 = X_m1_raw_df, Model2 = X_m2_raw_df, Model3 = X_m3_raw_df,
+  Model4 = X_m4_raw_df, Model5 = X_m5_raw_df
+)
+
+theta_hats_list <- list()
+X_processed_intercept_list <- list() # Stores X matrices with intercept, possibly scaled
+predictor_processing_info_list <- list() # Stores scaling info
+
+for (model_idx in 1:length(model_raw_predictors_dfs_list)) {
+  model_label <- names(model_raw_predictors_dfs_list)[model_idx]
+  X_raw_curr_df <- model_raw_predictors_dfs_list[[model_idx]]
+  X_raw_curr_matrix <- as.matrix(X_raw_curr_df)
+
+  X_processed_curr_no_int <- NULL
+  current_means <- NULL
+  current_sds <- NULL
+  processed_standardized_flag <- FALSE
+
+  if (SHOULD_STANDARDIZE_PREDICTORS) {
+    cat("Standardizing predictors for", model_label, "\n")
+    processed_standardized_flag <- TRUE
+    X_processed_curr_no_int <- scale(X_raw_curr_matrix, center = TRUE, scale = TRUE)
+    
+    if (any(is.nan(X_processed_curr_no_int))) {
+        warning_msg <- paste("Scaling produced NaNs for", model_label, "(likely due to zero variance in a predictor column). Replacing NaNs with 0.")
+        cat("Warning:", warning_msg, "\n")
+        # Identify columns with NaNs (these had zero variance)
+        nan_cols <- colnames(X_processed_curr_no_int)[apply(X_processed_curr_no_int, 2, anyNA)] # anyNA is more direct than any(is.nan()) for matrices
+        if(length(nan_cols) > 0) cat("Columns affected by NaN replacement:", paste(nan_cols, collapse=", "),"\n")
+        X_processed_curr_no_int[is.nan(X_processed_curr_no_int)] <- 0
+    }
+    current_means <- attr(X_processed_curr_no_int, "scaled:center")
+    current_sds <- attr(X_processed_curr_no_int, "scaled:scale")
+    # Ensure sds are not zero for columns that were not NaN, or set to 1 if they became 0 after NaN replacement
+    if(!is.null(current_sds)) current_sds[current_sds == 0] <- 1 
+
+  } else {
+    cat("Using raw (unstandardized) predictors for", model_label, "\n")
+    processed_standardized_flag <- FALSE
+    X_processed_curr_no_int <- X_raw_curr_matrix
+    # For unstandardized, means are effectively 0 and sds 1 if we think of it as "already processed" for storage
+    current_means <- rep(0, ncol(X_raw_curr_matrix)); names(current_means) <- colnames(X_raw_curr_matrix)
+    current_sds <- rep(1, ncol(X_raw_curr_matrix)); names(current_sds) <- colnames(X_raw_curr_matrix)
+  }
+
+  predictor_processing_info_list[[model_label]] <- list(
+    means = current_means,
+    sds = current_sds,
+    standardized = processed_standardized_flag
+  )
+
+  X_final_curr <- cbind(ones_col, X_processed_curr_no_int)
+  # Ensure colnames are unique and descriptive
+  colnames(X_final_curr) <- c("Intercept_Term", colnames(X_processed_curr_no_int)) 
+  X_processed_intercept_list[[model_label]] <- X_final_curr
+
+  # Check if number of rows is less than number of predictors (including intercept)
+  if (nrow(X_final_curr) < ncol(X_final_curr)) {
+    cat("Skipping", model_label, "- not enough rows (",nrow(X_final_curr),") for the number of predictors (",ncol(X_final_curr),").\n")
+    theta_hats_list[[model_label]] <- NA # Store NA to indicate failure/skip
+    next # Skip to next model
+  }
+
+  current_theta_hat <- tryCatch({
+    solve(t(X_final_curr) %*% X_final_curr) %*% t(X_final_curr) %*% Y_matrix
+  }, error = function(e) {
+    cat("Error calculating theta_hat for", model_label, "using solve() (likely singular matrix):", e$message, "\n")
+    cat("Attempting generalized inverse (MASS::ginv) as fallback for ", model_label, "\n")
+    tryCatch({ MASS::ginv(t(X_final_curr) %*% X_final_curr) %*% t(X_final_curr) %*% Y_matrix },
+             error = function(e_ginv) {
+                 cat("MASS::ginv also failed for", model_label, ":", e_ginv$message, "\n")
+                 return(NA) # Return NA if ginv also fails
+             })
+  })
+
+  if(is.matrix(current_theta_hat) && !any(is.na(current_theta_hat))) {
+    rownames(current_theta_hat) <- colnames(X_final_curr)
+  } else {
+    # If current_theta_hat is not a valid matrix (e.g. was NA from tryCatch), ensure it's a single NA
+    current_theta_hat <- NA 
+  }
+  theta_hats_list[[model_label]] <- current_theta_hat
+  cat("\nTheta_hat for ", model_label, " (using ", ifelse(processed_standardized_flag, "standardized", "raw"), " predictors):\n", sep=""); print(current_theta_hat)
+}
+```
+
+## Task 2.2: Calculate RSS
+
+```{r}
+RSSs_list <- list(); Y_hats_list <- list()
+for (model_label in names(X_processed_intercept_list)) {
+  # Check if theta_hat is a valid matrix (not a single NA)
+  if (is.matrix(theta_hats_list[[model_label]]) && !any(is.na(theta_hats_list[[model_label]]))) {
+    Y_hat_curr <- X_processed_intercept_list[[model_label]] %*% theta_hats_list[[model_label]]
+    Y_hats_list[[model_label]] <- Y_hat_curr
+    RSS_curr <- sum((Y_matrix - Y_hat_curr)^2, na.rm = TRUE) # na.rm for safety, though Y_matrix should be clean
+    RSSs_list[[model_label]] <- RSS_curr
+    cat(model_label, "- RSS:", RSS_curr, "\n")
+  } else {
+    RSSs_list[[model_label]] <- NA; Y_hats_list[[model_label]] <- NA
+    cat(model_label, "- RSS: NA (theta_hat calculation failed or model skipped)\n")
+  }
+}
+```
+
+## Task 2.3: Compute Log-Likelihood
+
+```{r}
+LogLikes_list <- list(); Variances_list <- list() # Variances_list stores the sigma_sq estimate
+for (model_label in names(RSSs_list)) {
+  if (!is.na(RSSs_list[[model_label]])) {
+    rss_val <- RSSs_list[[model_label]]
+    
+    # Per brief: ô² = RSS/(n-1)
+    # N_model is 'n'
+    if (N_model <= 1) { 
+        variance_val <- NA # Undefined or problematic
+        cat(model_label, "- Variance: NA (N_model <= 1)\n")
+    } else {
+        variance_val <- rss_val / (N_model - 1) 
+    }
+    Variances_list[[model_label]] <- variance_val
+
+    if (is.na(variance_val) || variance_val <= 1e-9) { # Avoid log(0) or log(negative), or issues with tiny variance
+      log_L_val <- -Inf # Or NA, depending on how to treat this. -Inf is common for likelihood.
+      cat(model_label, "- Var (RSS/(n-1)):", variance_val, "- LogLike set to -Inf due to problematic variance.\n")
+    } else {
+      log_L_val <- -(N_model/2)*log(2*pi) - (N_model/2)*log(variance_val) - (1/(2*variance_val))*rss_val
+      cat(model_label, "- Var (RSS/(n-1)):", variance_val, "- LogLike:", log_L_val, "\n")
+    }
+    LogLikes_list[[model_label]] <- log_L_val
+  } else {
+      LogLikes_list[[model_label]] <- NA; Variances_list[[model_label]] <- NA
+      cat(model_label, "- LogLike: NA (RSS was NA)\n")
+  }
+}
+```
+
+## Task 2.4: Compute AIC and BIC
+
+```{r}
+AICs_list <- list(); BICs_list <- list()
+for (model_label in names(LogLikes_list)) {
+  if (!is.na(LogLikes_list[[model_label]]) && is.finite(LogLikes_list[[model_label]])) {
+    # k_param = number of estimated regression coefficients (theta_0, theta_1, ... theta_p)
+    k_param <- if(is.matrix(theta_hats_list[[model_label]])) nrow(theta_hats_list[[model_label]]) else NA
+    
+    if(is.na(k_param)){ # If theta_hat failed or model skipped
+        AICs_list[[model_label]] <- NA; BICs_list[[model_label]] <- NA
+        cat(model_label, "- AIC/BIC: NA (k_param is NA)\n")
+        next
+    }
+    log_L_val <- LogLikes_list[[model_label]]
+
+    # For AIC/BIC, k is typically the number of freely estimated parameters in the model.
+    # This includes regression coefficients AND the variance of the errors.
+    # So, k_for_criteria = (number of regression coefficients) + 1 (for sigma^2)
+    k_for_criteria = k_param + 1 
+
+    aic_val <- 2*k_for_criteria - 2*log_L_val
+    bic_val <- k_for_criteria*log(N_model) - 2*log_L_val
+    AICs_list[[model_label]] <- aic_val; BICs_list[[model_label]] <- bic_val
+    cat(model_label, "- k (coeffs+variance):", k_for_criteria, "- AIC:", aic_val, "- BIC:", bic_val, "\n")
+  } else {
+      AICs_list[[model_label]] <- NA; BICs_list[[model_label]] <- NA
+      cat(model_label, "- AIC/BIC: NA (LogLikelihood was NA or not finite)\n")
+  }
+}
+
+model_summary_df <- data.frame(
+  Model = names(theta_hats_list),
+  k_coeffs = sapply(theta_hats_list, function(th) if(is.matrix(th) && !any(is.na(th))) nrow(th) else NA_integer_),
+  RSS = sapply(RSSs_list, function(x) ifelse(is.null(x) || is.na(x), NA_real_, x)),
+  LogLikelihood = sapply(LogLikes_list, function(x) ifelse(is.null(x) || is.na(x), NA_real_, x)),
+  AIC = sapply(AICs_list, function(x) ifelse(is.null(x) || is.na(x), NA_real_, x)),
+  BIC = sapply(BICs_list, function(x) ifelse(is.null(x) || is.na(x), NA_real_, x)),
+  Standardized_Predictors = sapply(predictor_processing_info_list, function(pinfo) pinfo$standardized) # Add info about standardization
+)
+rownames(model_summary_df) <- NULL
+cat("\n--- Model Comparison Summary ---\n")
+print(model_summary_df)
+```
+
+## Task 2.5: Model Prediction Errors (Residuals) Distribution
+
+```{r}
+# This list will store the individual Q-Q plots for potential use in Task 2.6.3
+individual_qq_plots_list <- list() 
+
+residuals_list_task2.5 <- list()
+valid_models_for_residuals <- c() 
+
+for (model_label in names(Y_hats_list)) {
+  if (is.matrix(Y_hats_list[[model_label]]) && !any(is.na(Y_hats_list[[model_label]]))) { 
+    residuals_curr <- Y_matrix - Y_hats_list[[model_label]]
+    residuals_list_task2.5[[model_label]] <- as.vector(residuals_curr) 
+    valid_models_for_residuals <- c(valid_models_for_residuals, model_label)
+  } else {
+    residuals_list_task2.5[[model_label]] <- NA 
+    individual_qq_plots_list[[model_label]] <- NULL # Ensure a NULL entry if residuals are NA
+  }
+}
+
+if (length(valid_models_for_residuals) > 0) {
+  cat("--- Individual Residual Distribution and Q-Q Plots ---\n")
+  for (model_label in valid_models_for_residuals) {
+    current_residuals_vec <- residuals_list_task2.5[[model_label]]
+    
+    cat("\n--- Residual Analysis for Model:", model_label, "---\n")
+
+    if(is.vector(current_residuals_vec) && length(current_residuals_vec) > 0 && any(is.finite(current_residuals_vec))) {
+      current_residuals_df <- data.frame(Residuals = current_residuals_vec)
+      
+      # Plot 1: Histogram of residuals for the current model
+      hist_res_plot_single <- ggplot(current_residuals_df, aes(x = Residuals)) +
+        geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "cornflowerblue", color = "black", alpha = 0.7, na.rm = TRUE) +
+        geom_density(color = "red", linewidth = 1, na.rm = TRUE, bw = "nrd0") +
+        labs(title = paste("Distribution of Residuals -", model_label),
+             subtitle = paste("Predictors Standardized:", SHOULD_STANDARDIZE_PREDICTORS),
+             x = "Residual Value", y = "Density") +
+        theme_light() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold", size=14),
+              plot.subtitle = element_text(hjust = 0.5, size=10),
+              axis.title = element_text(size=12))
+      print(hist_res_plot_single)
+      
+      # Plot 2: Q-Q plot of residuals for the current model
+      valid_res_for_qq <- na.omit(current_residuals_vec)
+      qq_plot_single_obj <- NULL # Initialize object to store the plot
+
+      if(length(unique(valid_res_for_qq)) < 2 || length(valid_res_for_qq) < 5){
+          cat("Warning: Model", model_label, "has insufficient or non-varying residuals for Q-Q plot generation.\n")
+          
+          qq_plot_single_obj <- ggplot() + 
+            annotate("text", x=0.5, y=0.5, label=paste("Q-Q Plot for", model_label, "\nNot enough valid data or no variance."), size=3) + 
+            labs(title=paste("Q-Q Plot of Residuals -", model_label),
+                 subtitle = paste("Predictors Standardized:", SHOULD_STANDARDIZE_PREDICTORS)) + 
+            theme_void() +
+            theme(plot.title = element_text(hjust = 0.5, face="bold", size=14),
+                  plot.subtitle = element_text(hjust = 0.5, size=10))
+          print(qq_plot_single_obj)
+
+      } else {
+          qq_plot_single_obj <- ggplot(current_residuals_df, aes(sample = Residuals)) +
+            stat_qq(alpha = 0.6, size=1.5, color="blue", na.rm = TRUE) +
+            stat_qq_line(color = "red", linewidth = 1, na.rm = TRUE) +
+            labs(title = paste("Q-Q Plot of Residuals -", model_label),
+                 subtitle = paste("Assessing Normality. Predictors Standardized:", SHOULD_STANDARDIZE_PREDICTORS),
+                 x = "Theoretical Quantiles (Normal)", y = "Sample Quantiles") +
+            theme_light() +
+            theme(plot.title = element_text(hjust = 0.5, face = "bold", size=14),
+                  plot.subtitle = element_text(hjust = 0.5, size=10),
+                  axis.title = element_text(size=12))
+          print(qq_plot_single_obj)
+      }
+      individual_qq_plots_list[[model_label]] <- qq_plot_single_obj # Store the generated plot object
+    } else {
+      cat("Task 2.5: Residuals for model", model_label, "are problematic or empty. Skipping plots for this model.\n")
+      individual_qq_plots_list[[model_label]] <- NULL # Store NULL if no plot was made
+    }
+  }
+} else {
+  cat("Task 2.5: No models had predictions computed successfully (Y_hats_list is empty or all NA).\n")
+  # Print a general placeholder if no models at all are valid
+   qq_plots_residuals_placeholder <- ggplot() + 
+    annotate("text", x=0.5,y=0.5,label="Q-Q Plots for residuals could not be generated\n(e.g. no valid models or residuals).") + 
+    theme_void() + labs(title="Q-Q Plots of Model Residuals")
+   print(qq_plots_residuals_placeholder)
+}
+```
+
+## Task 2.6: Select 'best' regression model
+
+### Task 2.6.1 Based on AIC (lower is better)
+
+```{r}
+valid_aic_indices <- !is.na(model_summary_df$AIC) & is.finite(model_summary_df$AIC)
+if (sum(valid_aic_indices) > 0) { # Use sum to check if any TRUE
+  best_model_aic_name <- model_summary_df$Model[valid_aic_indices][which.min(model_summary_df$AIC[valid_aic_indices])]
+  cat("Best model based on AIC:", best_model_aic_name, "\n")
+  cat("AIC value:", min(model_summary_df$AIC[valid_aic_indices], na.rm = TRUE), "\n")
+} else {
+  best_model_aic_name <- NA_character_
+  cat("Could not determine best model by AIC as all AIC values are NA or Inf.\n")
+}
+```
+
+### Task 2.6.2 Based on BIC (lower is better)
+
+```{r}
+valid_bic_indices <- !is.na(model_summary_df$BIC) & is.finite(model_summary_df$BIC)
+if (sum(valid_bic_indices) > 0) { # Use sum to check if any TRUE
+  best_model_bic_name <- model_summary_df$Model[valid_bic_indices][which.min(model_summary_df$BIC[valid_bic_indices])]
+  cat("Best model based on BIC:", best_model_bic_name, "\n")
+  cat("BIC value:", min(model_summary_df$BIC[valid_bic_indices], na.rm = TRUE), "\n")
+} else {
+  best_model_bic_name <- NA_character_
+  cat("Could not determine best model by BIC as all BIC values are NA or Inf.\n")
+}
+```
+
+### Task 2.6.3 Based on distribution of model residues
+To assess the models based on the distribution of their residuals, we will re-display the individual Q-Q plots generated in Task 2.5. A model whose residuals more closely follow a normal distribution (i.e., points on the Q-Q plot fall closer to the straight diagonal line) is generally preferred, as this is an assumption in many standard regression analyses.
+```{r}
+if (exists("individual_qq_plots_list") && length(individual_qq_plots_list) > 0) {
+  cat("Re-displaying individual Q-Q plots for model residuals assessment:\n\n")
+  for (model_label in names(individual_qq_plots_list)) {
+    if (!is.null(individual_qq_plots_list[[model_label]])) {
+      cat("Q-Q Plot for Model:", model_label, "\n")
+      print(individual_qq_plots_list[[model_label]])
+      cat("\n\n") # Add spacing between plots
+    } else {
+      # This case would mean the plot object was NULL even if the model_label key existed
+      # It should ideally be handled during the creation in Task 2.5
+      cat("No Q-Q plot available to display for Model:", model_label, "(plot object was NULL).\n\n")
+    }
+  }
+} else {
+  cat("No individual Q-Q plots were generated or are available from Task 2.5 to display for residual assessment.\n")
+  # Optionally, print a general placeholder if the list itself doesn't exist or is empty
+   qq_plots_residuals_placeholder <- ggplot() + 
+    annotate("text", x=0.5,y=0.5,label="Q-Q Plots for residuals could not be generated\n or `individual_qq_plots_list` is empty.") + 
+    theme_void() + labs(title="Q-Q Plots of Model Residuals")
+   print(qq_plots_residuals_placeholder)
+}
+```
+
+##### Visual Assessment Required: Review the Q-Q Plots
+
+-   Identify the model where the points fall closest to the straight diagonal line. This indicates residuals closest to a Normal distribution.
+
+### Task 2.6.4 Best model selection
+
+```{r}
+SELECTED_BEST_MODEL_NAME <- NA_character_ # Initialize
+if (!is.na(best_model_aic_name) && !is.na(best_model_bic_name) && (best_model_aic_name == best_model_bic_name)) {
+  SELECTED_BEST_MODEL_NAME <- best_model_bic_name 
+  cat("Selected model for further tasks (Task 2.7, Task 3):", SELECTED_BEST_MODEL_NAME, "(AIC and BIC agree)\n")
+} else {
+    cat("AIC and BIC selections differ or one/both were NA.\n")
+    cat("  Best by AIC:", ifelse(is.na(best_model_aic_name), "N/A", best_model_aic_name), "\n")
+    cat("  Best by BIC:", ifelse(is.na(best_model_bic_name), "N/A", best_model_bic_name), "\n")
+    # Fallback logic: prefer BIC if available, then AIC if BIC NA.
+    if (!is.na(best_model_bic_name)) {
+        SELECTED_BEST_MODEL_NAME <- best_model_bic_name
+        cat("Defaulting to BIC selection for further tasks:", SELECTED_BEST_MODEL_NAME, "\n")
+    } else if (!is.na(best_model_aic_name)) {
+        SELECTED_BEST_MODEL_NAME <- best_model_aic_name
+        cat("BIC selection was NA. Defaulting to AIC selection for further tasks:", SELECTED_BEST_MODEL_NAME, "\n")
+    } else {
+        cat("Both AIC and BIC best models are NA. Cannot automatically select a best model.\n")
+        cat("Please manually review Task 2.5 Q-Q plots and model_summary_df, then set SELECTED_BEST_MODEL_NAME if you wish to proceed.\n")
+    }
+}
+cat("Current selected model for Task 2.7 & 3:", SELECTED_BEST_MODEL_NAME, "\n")
+cat("This selection process used predictors that were:", ifelse(SHOULD_STANDARDIZE_PREDICTORS, "standardized.", "unstandardized."), "\n")
+```
+
+## Task 2.7: Train/Test Split and Prediction for the 'best' model
+
+```{r}
+# Ensure a model was selected and data is sufficient
+if (!is.na(SELECTED_BEST_MODEL_NAME) && (SELECTED_BEST_MODEL_NAME %in% model_summary_df$Model) && nrow(df) >= 20 ) {
+  set.seed(1026) # Seed for reproducibility of split and sampling
+
+  # Stratified split using rsample
+  split_data_obj <- initial_split(df, prop = 0.7, strata = energy_EP)
+  train_set_df <- training(split_data_obj)
+  test_set_df  <- testing(split_data_obj)
+
+  cat("Training data:", nrow(train_set_df), "rows. Testing data:", nrow(test_set_df), "rows.\n")
+
+  Y_train_vec <- train_set_df$energy_EP
+  Y_test_vec  <- test_set_df$energy_EP
+
+  # Function to construct the raw predictor dataframe for a given model ID
+  construct_X_raw_named_for_lm <- function(input_df_subset, model_id_str) {
+      # This function takes a subset of the main 'df' (like train_set_df or test_set_df)
+      # and constructs the specific transformed predictors for the model.
+      # It uses the original column names from 'df' for transformations.
+      if (model_id_str == "Model1") { 
+          out_df <- data.frame(humidity_RH = input_df_subset$humidity_RH, 
+                               pressure_AP_sq = input_df_subset$pressure_AP^2)
+      } else if (model_id_str == "Model2") { 
+          out_df <- data.frame(humidity_RH = input_df_subset$humidity_RH, 
+                               pressure_AP_sq = input_df_subset$pressure_AP^2, 
+                               vacuum_V = input_df_subset$vacuum_V)
+      } else if (model_id_str == "Model3") { 
+          out_df <- data.frame(pressure_AP = input_df_subset$pressure_AP, 
+                               humidity_RH = input_df_subset$humidity_RH, 
+                               vacuum_V_cubed = input_df_subset$vacuum_V^3)
+      } else if (model_id_str == "Model4") { 
+          out_df <- data.frame(humidity_RH = input_df_subset$humidity_RH, 
+                               pressure_AP_sq = input_df_subset$pressure_AP^2, 
+                               vacuum_V_cubed = input_df_subset$vacuum_V^3)
+      } else if (model_id_str == "Model5") { 
+          out_df <- data.frame(humidity_RH = input_df_subset$humidity_RH, 
+                               temp_T_sq = input_df_subset$temp_T^2, 
+                               pressure_AP_sq = input_df_subset$pressure_AP^2)
+      } else { 
+          stop("Unknown model_id_str for X matrix construction in Task 2.7: ", model_id_str) 
+      }
+      return(out_df)
+  }
+
+  X_train_best_raw_df <- construct_X_raw_named_for_lm(train_set_df, SELECTED_BEST_MODEL_NAME)
+  # Combine predictors with target for lm() function data argument
+  train_lm_df_task2.7 <- cbind(energy_EP = Y_train_vec, X_train_best_raw_df)
+  
+  terms_for_formula <- colnames(X_train_best_raw_df)
+  formula_string_terms <- ""
+  if (SHOULD_STANDARDIZE_PREDICTORS) {
+    cat("Using scaled predictors for lm() in Task 2.7.\n")
+    formula_string_terms <- paste0("scale(`", terms_for_formula, "`)", collapse = " + ") # Backticks for special chars if any
+  } else {
+    cat("Using raw predictors for lm() in Task 2.7.\n")
+    formula_string_terms <- paste0("`", terms_for_formula, "`", collapse = " + ") # Backticks for safety
+  }
+  formula_lm_best_task2.7 <- as.formula(paste("energy_EP ~", formula_string_terms))
+  cat("Formula for lm:", deparse1(formula_lm_best_task2.7), "\n") # deparse1 for cleaner output
+
+  lm_best_train_fit <- lm(formula_lm_best_task2.7, data=train_lm_df_task2.7)
+  cat("\n(1) Estimated Model Parameters (from training data fit for", SELECTED_BEST_MODEL_NAME, "):\n")
+  print(summary(lm_best_train_fit))
+  
+  X_test_best_for_predict_df  <- construct_X_raw_named_for_lm(test_set_df, SELECTED_BEST_MODEL_NAME)
+  
+  pred_intervals_lm <- predict(lm_best_train_fit, newdata=X_test_best_for_predict_df, interval="prediction", level=0.95)
+
+  plot_test_results_df <- data.frame(
+    Actual = Y_test_vec, Predicted = pred_intervals_lm[,"fit"],
+    LowerPI = pred_intervals_lm[,"lwr"], UpperPI = pred_intervals_lm[,"upr"]
+  )
+  plot_test_results_df$Index <- 1:nrow(plot_test_results_df) # Index for plotting
+
+  # Sample for plotting if test set is large
+  plot_sample_indices <- if(nrow(plot_test_results_df) > 200) {
+      sample(plot_test_results_df$Index, 200)
+  } else {
+      plot_test_results_df$Index
+  }
+  plot_data_sample <- plot_test_results_df[plot_test_results_df$Index %in% plot_sample_indices, ]
+  plot_data_sample <- plot_data_sample[order(plot_data_sample$Index), ] # Keep original order for line plot illusion
+
+  p_pred_interval <- ggplot(plot_data_sample, aes(x = Index)) +
+    geom_point(aes(y = Actual, color = "Actual Samples"), shape = 19, size = 1.5, alpha=0.7) +
+    geom_line(aes(y = Predicted, color = "Model Predictions"), linewidth = 0.8, alpha=0.8) + # Line for predictions
+    geom_point(aes(y = Predicted, color = "Model Predictions"), shape = 4, size = 1.5, alpha=0.7) + # Points for predictions
+    geom_ribbon(aes(ymin = LowerPI, ymax = UpperPI, fill = "95% PI"), alpha = 0.25) +
+    scale_color_manual(name = "Legend", values = c("Actual Samples" = "black", "Model Predictions" = "blue")) +
+    scale_fill_manual(name = "", values = c("95% PI" = "steelblue")) +
+    guides(color = guide_legend(override.aes = list(alpha=1, shape=c(19,4))), fill = guide_legend(override.aes = list(alpha=0.25))) +
+    labs(title = paste("Test Predictions & 95% PI -", SELECTED_BEST_MODEL_NAME,
+                       if(length(plot_sample_indices) != nrow(plot_test_results_df)) "(Sampled)" else ""),
+         x = "Test Sample Index (subset, ordered)", y = "Energy Output (EP)") +
+    theme_light() +
+    theme(plot.title = element_text(hjust = 0.5, face="bold"),
+          legend.position = "bottom", legend.box="horizontal",
+          axis.title = element_text(size=12))
+  print(p_pred_interval)
+
+  p_actual_vs_pred <- ggplot(plot_test_results_df, aes(x = Actual, y = Predicted)) +
+    geom_point(alpha = 0.3, color = "blue", size = 1.5, na.rm=TRUE) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", linewidth = 1) +
+    labs(title = paste("Test Actual vs. Predicted -", SELECTED_BEST_MODEL_NAME),
+         x = "Actual Energy Output (EP)", y = "Predicted Energy Output (EP)") +
+    theme_light() + coord_fixed() + 
+    theme(plot.title = element_text(hjust = 0.5, face="bold"),
+          axis.title = element_text(size=12))
+  print(p_actual_vs_pred)
+  
+  test_residuals <- plot_test_results_df$Actual - plot_test_results_df$Predicted
+  test_residuals_df <- data.frame(Residuals = test_residuals)
+
+  p_hist_test_res <- ggplot(test_residuals_df, aes(x = Residuals)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "wheat", color = "black", alpha = 0.7, na.rm=TRUE) +
+    geom_density(color = "orange", linewidth = 1, na.rm=TRUE, bw="nrd0") +
+    labs(title = "Histogram of Test Residuals", subtitle=SELECTED_BEST_MODEL_NAME, x = "Residual Value", y = "Density") +
+    theme_light() +
+    theme(plot.title = element_text(hjust = 0.5, face="bold"), plot.subtitle = element_text(hjust=0.5),
+          axis.title = element_text(size=12))
+  print(p_hist_test_res)
+
+  valid_test_residuals <- test_residuals[!is.na(test_residuals)]
+  if(length(unique(valid_test_residuals)) > 1 && length(valid_test_residuals) > 5){
+      p_qq_test_res <- ggplot(test_residuals_df, aes(sample = Residuals)) +
+        stat_qq(alpha=0.5, size=1, na.rm=TRUE) + stat_qq_line(color = "orange", linewidth = 0.8, na.rm=TRUE) +
+        labs(title = "Q-Q Plot of Test Residuals", subtitle=SELECTED_BEST_MODEL_NAME, x = "Theoretical Quantiles", y = "Sample Quantiles") +
+        theme_light() +
+        theme(plot.title = element_text(hjust = 0.5, face="bold"), plot.subtitle = element_text(hjust=0.5),
+              axis.title = element_text(size=12))
+      print(p_qq_test_res)
+  } else {
+      p_qq_test_res_placeholder <- ggplot() + 
+          annotate("text", x=0.5, y=0.5, label="Q-Q Plot (Test Residuals)\nNot enough valid data or no variance.", size=3) + 
+          labs(title="Q-Q Plot of Test Residuals", subtitle=SELECTED_BEST_MODEL_NAME) +
+          theme_void() + theme(plot.title = element_text(hjust = 0.5, face="bold"), plot.subtitle = element_text(hjust=0.5))
+      print(p_qq_test_res_placeholder)
+  }
+
+} else {
+  cat("Best model ('", SELECTED_BEST_MODEL_NAME, "') not identified, not in summary, or not enough data. Skipping Task 2.7.\n", sep="")
+}
+```
+
+# Task 3: Approximate Bayesian Computation (ABC)
+
+```{r}
+# Ensure a model was selected and its parameters were estimated
+if (is.na(SELECTED_BEST_MODEL_NAME) || !(SELECTED_BEST_MODEL_NAME %in% names(theta_hats_list))) {
+  cat("Skipping Task 3: SELECTED_BEST_MODEL_NAME ('", SELECTED_BEST_MODEL_NAME, "') is not valid or its definition is missing from theta_hats_list.\n", sep="")
+} else if (!is.matrix(theta_hats_list[[SELECTED_BEST_MODEL_NAME]]) || any(is.na(theta_hats_list[[SELECTED_BEST_MODEL_NAME]]))) {
+  cat("Skipping Task 3: Parameters for the selected best model ('", SELECTED_BEST_MODEL_NAME, "') are NA or not a matrix (estimation may have failed).\n", sep="")
+} else {
+  cat("Proceeding with Task 3 for selected model:", SELECTED_BEST_MODEL_NAME, "\n")
+  set.seed(2024) # Seed for reproducibility of ABC simulations
+
+  # 1. Identify 2 parameters with largest absolute value from Task 2.1 estimates
+  theta_mle_best_model_matrix <- theta_hats_list[[SELECTED_BEST_MODEL_NAME]]
+  theta_mle_best_model_vec <- theta_mle_best_model_matrix[,1] # Extract as vector
+  theta_mle_best_model_names <- rownames(theta_mle_best_model_matrix)
+  names(theta_mle_best_model_vec) <- theta_mle_best_model_names # Ensure names are set
+  
+  param_abs_values <- abs(theta_mle_best_model_vec)
+  num_params_to_select_abc <- min(2, length(param_abs_values[param_abs_values > 1e-9])) 
+  
+  stop_abc_task3_early <- FALSE 
+  if(num_params_to_select_abc < 2){
+      cat("Warning: Selected model has fewer than 2 effectively non-zero parameters for ABC. ABC will proceed with", num_params_to_select_abc, "parameter(s) if possible.\n")
+      if(num_params_to_select_abc == 0) {
+          cat("Error: No effectively non-zero parameters found for ABC. Skipping Task 3.\n")
+          stop_abc_task3_early <- TRUE 
+      }
+  }
+  
+  if(!stop_abc_task3_early){
+    valid_param_indices_for_abc <- which(param_abs_values > 1e-9)
+    ordered_valid_indices <- valid_param_indices_for_abc[order(param_abs_values[valid_param_indices_for_abc], decreasing = TRUE)]
+    top_indices <- ordered_valid_indices[1:num_params_to_select_abc]
+        
+    abc_param_names <- theta_mle_best_model_names[top_indices]
+    abc_param_mle_values <- theta_mle_best_model_vec[top_indices]
+    
+    cat("Parameters selected for ABC (largest abs value from MLE):", paste(abc_param_names, collapse=", "), "\n")
+    cat("Their MLE values:", paste(round(abc_param_mle_values,4), collapse=", "), "\n")
+
+    theta_full_template <- theta_mle_best_model_vec 
+    
+    prior_abs_component <- 1.5 
+    prior_rel_component <- 1.5 
+    
+    priors_list <- list()
+    for (i in 1:length(abc_param_names)) { 
+      mle_val <- abc_param_mle_values[i]
+      half_width <- max(1e-6, prior_abs_component + prior_rel_component * abs(mle_val)) 
+      priors_list[[abc_param_names[i]]] <- c(mle_val - half_width, mle_val + half_width)
+      cat("Prior for", abc_param_names[i], ": Uniform(", round(priors_list[[abc_param_names[i]]][1],3), ",", round(priors_list[[abc_param_names[i]]][2],3), ")\n")
+    }
+
+    N_abc_sims <- 50000 # Reduced for quicker testing if needed, use 50000 for final run
+    
+    X_matrix_best_model_abc <- X_processed_intercept_list[[SELECTED_BEST_MODEL_NAME]]
+    
+    rss_best_model_mle <- RSSs_list[[SELECTED_BEST_MODEL_NAME]] 
+    n_obs_abc <- N_model 
+    k_params_best_model_coeffs <- length(theta_mle_best_model_vec) 
+    
+    stop_abc_due_to_variance_or_params <- FALSE 
+    if (n_obs_abc <= k_params_best_model_coeffs) {
+      cat("Error: Not enough observations (", n_obs_abc, ") relative to parameters (", k_params_best_model_coeffs, "). This might affect epsilon logic. Skipping ABC.\n")
+      stop_abc_due_to_variance_or_params <- TRUE
+    }
+    if (num_params_to_select_abc != 2) {
+        cat("Task 3 ABC as implemented requires exactly 2 parameters for joint/marginal plotting. Found:", num_params_to_select_abc, ". Skipping detailed ABC analysis.\n")
+        stop_abc_due_to_variance_or_params <- TRUE
+    }
+
+
+    if (!stop_abc_due_to_variance_or_params) { 
+      rss_sim_for_epsilon_calibration <- numeric(1000) 
+      cat("Calibrating epsilon for ABC rejection (simulating RSS from prior):\n")
+      # pb_epsilon <- txtProgressBar(min=0, max=length(rss_sim_for_epsilon_calibration), style=3, width=50) # Commented out for brevity in output
+      
+      theta_eps_calib <- theta_full_template 
+      for (i_eps in 1:length(rss_sim_for_epsilon_calibration)) {
+        # if (i_eps %% 10 == 0) setTxtProgressBar(pb_epsilon, i_eps) # Commented out
+        theta_eps_calib[abc_param_names[1]] <- runif(1, priors_list[[abc_param_names[1]]][1], priors_list[[abc_param_names[1]]][2])
+        theta_eps_calib[abc_param_names[2]] <- runif(1, priors_list[[abc_param_names[2]]][1], priors_list[[abc_param_names[2]]][2])
+        
+        Y_hat_sampled_eps <- X_matrix_best_model_abc %*% theta_eps_calib
+        rss_sim_for_epsilon_calibration[i_eps] <- sum((Y_matrix - Y_hat_sampled_eps)^2, na.rm=TRUE)
+      }
+      # close(pb_epsilon); cat("\n") # Commented out
+      
+      epsilon_abc <- quantile(rss_sim_for_epsilon_calibration, probs = 0.01, na.rm = TRUE) 
+      cat("Proposed epsilon (1st percentile of simulated RSS from prior):", epsilon_abc, "\n")
+      cat("RSS from MLE fit:", rss_best_model_mle, "\n")
+
+      if(is.na(epsilon_abc) || epsilon_abc <= 0 || !is.finite(epsilon_abc) || epsilon_abc < rss_best_model_mle * 0.1 ){ 
+          original_epsilon_proposal <- epsilon_abc
+          epsilon_abc <- rss_best_model_mle * 1.1 
+          cat("Warning: Proposed epsilon (", original_epsilon_proposal, ") was problematic or too small. Using fallback epsilon:", epsilon_abc, "\n")
+          if(is.na(epsilon_abc) || epsilon_abc <= 0 || !is.finite(epsilon_abc)) { 
+              cat("Critical Error: Fallback epsilon also problematic. Aborting ABC.\n")
+              stop_abc_due_to_variance_or_params <- TRUE 
+          }
+      }
+      cat("Final epsilon for ABC:", epsilon_abc, "\n")
+
+
+      if (!stop_abc_due_to_variance_or_params) { 
+          cat("Running ABC simulations (N_sims =", N_abc_sims, "):\n")
+          # pb_abc <- txtProgressBar(min = 0, max = N_abc_sims, style = 3, width=50) # Commented out
+          accepted_param1_samples <- numeric(0)
+          accepted_param2_samples <- numeric(0)
+          
+          theta_current_sample_abc <- theta_full_template 
+          for (sim_idx in 1:N_abc_sims) {
+            # if (sim_idx %% (N_abc_sims/100) == 0) setTxtProgressBar(pb_abc, sim_idx) # Commented out
+
+            p1_sampled <- runif(1, priors_list[[abc_param_names[1]]][1], priors_list[[abc_param_names[1]]][2])
+            p2_sampled <- runif(1, priors_list[[abc_param_names[2]]][1], priors_list[[abc_param_names[2]]][2])
+            theta_current_sample_abc[abc_param_names[1]] <- p1_sampled
+            theta_current_sample_abc[abc_param_names[2]] <- p2_sampled
+            
+            Y_hat_current_sim_abc <- X_matrix_best_model_abc %*% theta_current_sample_abc
+            rss_current_sim_abc <- sum((Y_matrix - Y_hat_current_sim_abc)^2, na.rm=TRUE)
+            
+            if (!is.na(rss_current_sim_abc) && rss_current_sim_abc < epsilon_abc) {
+              accepted_param1_samples <- c(accepted_param1_samples, p1_sampled)
+              accepted_param2_samples <- c(accepted_param2_samples, p2_sampled)
+            }
+          }
+          # close(pb_abc); # Commented out
+          cat("\nNumber of accepted samples:", length(accepted_param1_samples), "\n")
+
+          if (length(accepted_param1_samples) < 20) { 
+            cat("Too few samples accepted for reliable posterior plots (accepted < 20). Consider increasing N_abc_sims or epsilon, or check prior ranges.\n")
+          } else {
+            accepted_df <- data.frame(Param1_ABC = accepted_param1_samples, Param2_ABC = accepted_param2_samples)
+            colnames(accepted_df) <- abc_param_names[1:2] 
+
+            N_plot_max_abc <- min(5000, nrow(accepted_df)) 
+            if (nrow(accepted_df) > N_plot_max_abc) {
+              cat("Thinning accepted samples for plotting (displaying", N_plot_max_abc, "out of", nrow(accepted_df), ").\n")
+              plot_indices_abc <- sample(nrow(accepted_df), N_plot_max_abc)
+              accepted_df_plot <- accepted_df[plot_indices_abc, ]
+            } else {
+              accepted_df_plot <- accepted_df
+            }
+
+            # 4. Plot joint and marginal posterior distributions (SEPARATELY)
+            
+            # --- Joint Posterior Plot ---
+            plot_joint_posterior <- ggplot(accepted_df_plot, aes(x = .data[[abc_param_names[1]]], y = .data[[abc_param_names[2]]])) +
+              geom_point(alpha = 0.2, size=1.5, color="dodgerblue4", na.rm=TRUE) +
+              stat_density_2d(aes(fill = after_stat(level)), geom = "polygon", alpha = 0.3, color="grey50", linewidth=0.3, contour=TRUE, na.rm=TRUE) +
+              scale_fill_gradient(low = "lightblue", high = "dodgerblue3", name = "Density Level") +
+              geom_point(aes(x = abc_param_mle_values[1], y = abc_param_mle_values[2]), color = "red", size = 4, shape = 4, stroke=1.5) +
+              annotate("text", x = abc_param_mle_values[1], y = abc_param_mle_values[2], label = "MLE", color = "red", hjust = -0.2, vjust = -0.5, fontface="bold", size=3.5) +
+              labs(title = "Joint Posterior Distribution (ABC)",
+                   subtitle = paste("Model:", SELECTED_BEST_MODEL_NAME),
+                   x = paste("Parameter:", abc_param_names[1]),
+                   y = paste("Parameter:", abc_param_names[2]),
+                   caption = paste("Based on", length(accepted_param1_samples),"accepted samples from",N_abc_sims,"simulations. Epsilon (RSS threshold):",round(epsilon_abc,3))) +
+              theme_light(base_size = 10) + 
+              theme(plot.title = element_text(hjust = 0.5, face = "bold", size=14),
+                    plot.subtitle = element_text(hjust = 0.5, size=9),
+                    axis.title = element_text(size=11), legend.position = "right",
+                    panel.grid.minor = element_blank(),
+                    plot.caption = element_text(hjust=0, size=9, face="italic"))
+            print(plot_joint_posterior)
+            
+            # --- Marginal Posterior Plot for Parameter 1 ---
+            plot_marginal1 <- ggplot(accepted_df, aes(x = .data[[abc_param_names[1]]])) +
+              geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "skyblue", color = "black", alpha = 0.7, na.rm=TRUE) +
+              geom_density(color = "red", linewidth = 1, na.rm=TRUE, bw="nrd0") +
+              geom_vline(xintercept = abc_param_mle_values[1], color = "red", linetype = "dashed", linewidth = 1.1) +
+              annotate("text", x = abc_param_mle_values[1], y = 0, label = " MLE", color = "red", hjust = -0.1, vjust=-0.5, angle=90, fontface="bold", size=3) +
+              labs(title = paste("Marginal Posterior (ABC):", abc_param_names[1]), 
+                   subtitle = paste("Model:", SELECTED_BEST_MODEL_NAME),
+                   x = "Parameter Value", y = "Density",
+                   caption = paste("Based on", length(accepted_param1_samples),"accepted samples from",N_abc_sims,"simulations.")) +
+              theme_light(base_size = 10) +
+              theme(plot.title = element_text(hjust = 0.5, face = "bold", size=12),
+                    plot.subtitle = element_text(hjust = 0.5, size=9),
+                    axis.title = element_text(size=10), panel.grid.minor = element_blank(),
+                    plot.caption = element_text(hjust=0, size=9, face="italic"))
+            print(plot_marginal1)
+
+            # --- Marginal Posterior Plot for Parameter 2 ---
+            plot_marginal2 <- ggplot(accepted_df, aes(x = .data[[abc_param_names[2]]])) +
+              geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "lightcoral", color = "black", alpha = 0.7, na.rm=TRUE) +
+              geom_density(color = "darkred", linewidth = 1, na.rm=TRUE, bw="nrd0") +
+              geom_vline(xintercept = abc_param_mle_values[2], color = "darkred", linetype = "dashed", linewidth = 1.1) +
+              annotate("text", x = abc_param_mle_values[2], y = 0, label = " MLE", color = "darkred", hjust = -0.1, vjust=-0.5, angle=90, fontface="bold", size=3) +
+              labs(title = paste("Marginal Posterior (ABC):", abc_param_names[2]),
+                   subtitle = paste("Model:", SELECTED_BEST_MODEL_NAME),
+                   x = "Parameter Value", y = "Density",
+                   caption = paste("Based on", length(accepted_param1_samples),"accepted samples from",N_abc_sims,"simulations.")) +
+              theme_light(base_size = 10) +
+              theme(plot.title = element_text(hjust = 0.5, face = "bold", size=12),
+                    plot.subtitle = element_text(hjust = 0.5, size=9),
+                    axis.title = element_text(size=10), panel.grid.minor = element_blank(),
+                    plot.caption = element_text(hjust=0, size=9, face="italic"))
+            print(plot_marginal2)
+            
+            # Explanation text remains the same
+            cat("\n5. Explanation of ABC Results (for model '", SELECTED_BEST_MODEL_NAME, "'):\n", sep="")
+            cat("The Approximate Bayesian Computation (ABC) was performed for parameters '", abc_param_names[1], "' and '", abc_param_names[2], 
+                "'. These were chosen as they had the largest absolute Maximum Likelihood Estimate (MLE) values from Task 2.1.\n", sep="")
+            cat("Uniform priors were defined for these two parameters, centered around their MLEs with a calculated spread. The prior ranges were: \n",
+                "  Parameter '", abc_param_names[1], "': Uniform(", round(priors_list[[abc_param_names[1]]][1],3), ",", round(priors_list[[abc_param_names[1]]][2],3), ")\n",
+                "  Parameter '", abc_param_names[2], "': Uniform(", round(priors_list[[abc_param_names[2]]][1],3), ",", round(priors_list[[abc_param_names[2]]][2],3), ")\n", sep="")
+            cat("The Rejection ABC algorithm was used. For each simulation, parameter sets were sampled from these priors (with other parameters fixed at their MLEs). The model's predictions were generated, and the sum of squared residuals (RSS) compared to the observed data was calculated. If this RSS was less than a dynamically calibrated tolerance (epsilon_abc = ", round(epsilon_abc,3), "), the sampled parameter set was accepted as part of the approximate posterior distribution.\n", sep="")
+            cat("An acceptance rate of ", round(length(accepted_param1_samples)/N_abc_sims * 100, 2), "% was achieved from ", N_abc_sims, " total simulations.\n", sep="")
+            cat("\nInterpretation of the Plots:\n")
+            cat("- Joint Posterior Distribution (Plot 1): Shows the 2D density of accepted samples for '", abc_param_names[1], "' and '", abc_param_names[2], "'. Contours and scatter points illustrate the joint posterior belief. Any correlation between the parameters (e.g., an elliptical shape) would be visible here. The red 'X' marks the original MLE point for reference.\n", sep="")
+            cat("- Marginal Posterior Distributions (Plots 2 & 3): Display 1D histograms and density estimates for each parameter individually. These represent the posterior belief about each parameter, having integrated out the uncertainty from the other. Dashed red lines indicate the MLE values.\n")
+            cat("Key observations from these plots generally include:\n")
+            cat("  - Location (Central Tendency): Where the posterior mass is centered. This can be compared to the MLE. If the posterior is shifted from the MLE, it might suggest influence from the prior or aspects of the data not captured well by the point estimate.\n")
+            cat("  - Spread (Uncertainty): The width of the posteriors reflects the uncertainty in the parameter estimates. Narrower posteriors imply more precise estimates given the data, model, and priors.\n")
+            cat("  - Shape: Skewness, multi-modality, or other features in the posterior shape can indicate complexities in the likelihood surface, interactions between parameters, or strong influence from the chosen priors (though priors were uniform here).\n")
+            cat("If the MLE lies far outside the main posterior mass, or if posteriors are very wide (indicating high uncertainty) or significantly different from the uniform priors (not explicitly plotted but were the sampling basis), it could suggest model misspecification, issues with prior choices, or that the data provides limited information for these specific parameters under the current model structure.\n")
+            cat("The goal is to provide a probabilistic understanding of the plausible range for these key parameters, conditional on the observed data and the assumed model.\n")
+          } 
+      } 
+    } else { 
+        cat("Task 3 ABC detailed analysis (simulations and plotting) skipped due to earlier critical errors or insufficient parameters for the 2-parameter ABC setup.\n")
+    }
+  }
+} 
+```
