@@ -188,7 +188,6 @@ for (var_name in variables_to_plot_ts) {
   p <- ggplot(df_plot_gg, aes(x = Index, y = .data[[var_name]])) +
     geom_line(color = "steelblue", alpha = 0.8) +
     labs(title = paste("Full Time Series of", var_name),
-         subtitle = "Note: Index is data order, not true time as data may be shuffled.",
          x = "Index (Time Proxy)",
          y = var_name) +
     theme_light() +
@@ -197,6 +196,8 @@ for (var_name in variables_to_plot_ts) {
           axis.title = element_text(size=12))
   print(p)
 }
+
+cat("Generating Time Series Plot frame by frame")
 
 frame_limits <- list(
   Frame1 = c(1, 100),
@@ -207,40 +208,86 @@ frame_limits <- list(
 current_n_rows <- nrow(df_plot_gg)
 
 for (var_name in variables_to_plot_ts) {
-  cat("\n--- Framed Time Series Plots for:", var_name, "---\n")
+  frame_plot_list <- list() # To store plots for each frame
+
   for (frame_name in names(frame_limits)) {
     start_idx <- frame_limits[[frame_name]][1]
     end_idx <- frame_limits[[frame_name]][2]
 
-    # Adjust end_idx if it exceeds the number of rows
-    actual_end_idx <- min(end_idx, current_n_rows)
+    actual_end_idx <- min(end_idx, current_n_rows) # Adjust end_idx if it exceeds the number of rows
+
+    p_frame <- NULL # Initialize p_frame for this iteration
 
     if (start_idx <= current_n_rows) {
-      # Ensure start_idx is not greater than actual_end_idx (e.g. if current_n_rows is small)
-      actual_start_idx <- min(start_idx, actual_end_idx)
+      actual_start_idx <- min(start_idx, actual_end_idx) # Ensure start_idx is not greater than actual_end_idx
       
       subset_df <- df_plot_gg[actual_start_idx:actual_end_idx, ]
       
       if (nrow(subset_df) > 1) { # Need at least 2 points to draw a line
         p_frame <- ggplot(subset_df, aes(x = Index, y = .data[[var_name]])) +
           geom_line(color = "darkorange", alpha = 0.9) +
-          geom_point(color = "darkorange", size = 1, alpha = 0.7) + # Add points for clarity in shorter series
-          labs(title = paste(frame_name, "Time Series of", var_name, "(Indices:", actual_start_idx, "-", actual_end_idx, ")"),
-               x = "Index (Time Proxy)",
-               y = var_name) +
+          geom_point(color = "darkorange", size = 1, alpha = 0.7) +
+          labs(title = paste(frame_name, "(Indices:", actual_start_idx, "-", actual_end_idx, ")"), # Subplot title
+               x = "Index (Time Proxy)", # Simplified x-axis label for subplots
+              y = var_name) +    
           theme_light() +
-          theme(plot.title = element_text(hjust = 0.5, face = "bold", size=12),
-                axis.title = element_text(size=10))
-        print(p_frame)
+          theme(plot.title = element_text(hjust = 0.5, face = "bold", size=10), # Smaller title for subplot
+                axis.title = element_text(size=9))
       } else {
-        cat("Not enough data points in", frame_name, "(Indices:", actual_start_idx, "-", actual_end_idx, ") for", var_name, "to plot a line.\n")
+        # Create a placeholder plot if not enough data
+        message_text <- paste("Not enough data in", frame_name, "\n(Indices:", actual_start_idx, "-", actual_end_idx, ")\nfor", var_name)
+        p_frame <- ggplot() + 
+                   annotate("text", x = 0.5, y = 0.5, label = message_text, size = 3, hjust = 0.5) +
+                   labs(title = frame_name) +
+                   theme_void() +
+                   theme(plot.title = element_text(hjust = 0.5, size=10))
+        cat(message_text, "\n")
       }
     } else {
-      cat(frame_name, "for", var_name, "is beyond the data length (", current_n_rows, "rows). Skipping.\n")
-      break # Stop trying further frames for this variable if start_idx is already too high
+      # Create a placeholder plot if frame is beyond data length
+      message_text <- paste(frame_name, "for", var_name, "\nis beyond data length (", current_n_rows, "rows).")
+      p_frame <- ggplot() + 
+                 annotate("text", x = 0.5, y = 0.5, label = message_text, size = 3, hjust = 0.5) +
+                 labs(title = frame_name) +
+                 theme_void() +
+                 theme(plot.title = element_text(hjust = 0.5, size=10))
+      cat(message_text, "Skipping further frames for this variable.\n")
     }
+    
+    if (!is.null(p_frame)) {
+        frame_plot_list[[frame_name]] <- p_frame
+    }
+  } # End of loop for frames
+
+  # Combine the plots for the current variable if list is not empty
+  if (length(frame_plot_list) > 0) {
+    # This helps maintain a consistent layout.
+    plots_to_combine <- lapply(names(frame_limits), function(fn) {
+      if (fn %in% names(frame_plot_list)) {
+        return(frame_plot_list[[fn]])
+      } else {
+        # Create a generic placeholder.
+        return(ggplot() + 
+               annotate("text", x=0.5, y=0.5, label=paste("Data for\n", fn, "\nnot available")) + 
+               labs(title=fn) + 
+               theme_void() +
+               theme(plot.title = element_text(hjust=0.5, size=10)))
+      }
+    })
+
+    combined_plot <- wrap_plots(plots_to_combine, ncol = 1) # Arrange in 1 row, 1 column
+
+    combined_plot <- combined_plot + plot_annotation(
+      title = paste("Framed Time Series of", var_name),
+      theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size=16),
+                    plot.subtitle = element_text(hjust = 0.5, size=12))
+    )
+    print(combined_plot)
+  } else {
+    cat("No frames were generated for", var_name, "to combine.\n")
   }
-}
+  
+} # End of loop for variables
 ```
 
 ## Task 1.2: Distribution for each signal
@@ -747,7 +794,7 @@ if (!is.na(best_model_aic_name) && !is.na(best_model_bic_name) && (best_model_ai
         cat("BIC selection was NA. Defaulting to AIC selection for further tasks:", SELECTED_BEST_MODEL_NAME, "\n")
     } else {
         cat("Both AIC and BIC best models are NA. Cannot automatically select a best model.\n")
-        cat("Please manually review Task 2.5 Q-Q plots and model_summary_df, then set SELECTED_BEST_MODEL_NAME if you wish to proceed.\n")
+        cat("Please manually review Task 2.5 Q-Q plots and model_summary_df, then set SELECTED_BEST_MODEL_NAME\n")
     }
 }
 cat("Current selected model for Task 2.7 & 3:", SELECTED_BEST_MODEL_NAME, "\n")
@@ -977,18 +1024,15 @@ if (is.na(SELECTED_BEST_MODEL_NAME) || !(SELECTED_BEST_MODEL_NAME %in% names(the
     if (!stop_abc_due_to_variance_or_params) { 
       rss_sim_for_epsilon_calibration <- numeric(1000) 
       cat("Calibrating epsilon for ABC rejection (simulating RSS from prior):\n")
-      # pb_epsilon <- txtProgressBar(min=0, max=length(rss_sim_for_epsilon_calibration), style=3, width=50) # Commented out for brevity in output
       
       theta_eps_calib <- theta_full_template 
       for (i_eps in 1:length(rss_sim_for_epsilon_calibration)) {
-        # if (i_eps %% 10 == 0) setTxtProgressBar(pb_epsilon, i_eps) # Commented out
         theta_eps_calib[abc_param_names[1]] <- runif(1, priors_list[[abc_param_names[1]]][1], priors_list[[abc_param_names[1]]][2])
         theta_eps_calib[abc_param_names[2]] <- runif(1, priors_list[[abc_param_names[2]]][1], priors_list[[abc_param_names[2]]][2])
         
         Y_hat_sampled_eps <- X_matrix_best_model_abc %*% theta_eps_calib
         rss_sim_for_epsilon_calibration[i_eps] <- sum((Y_matrix - Y_hat_sampled_eps)^2, na.rm=TRUE)
       }
-      # close(pb_epsilon); cat("\n") # Commented out
       
       epsilon_abc <- quantile(rss_sim_for_epsilon_calibration, probs = 0.01, na.rm = TRUE) 
       cat("Proposed epsilon (1st percentile of simulated RSS from prior):", epsilon_abc, "\n")
@@ -1008,13 +1052,11 @@ if (is.na(SELECTED_BEST_MODEL_NAME) || !(SELECTED_BEST_MODEL_NAME %in% names(the
 
       if (!stop_abc_due_to_variance_or_params) { 
           cat("Running ABC simulations (N_sims =", N_abc_sims, "):\n")
-          # pb_abc <- txtProgressBar(min = 0, max = N_abc_sims, style = 3, width=50) # Commented out
           accepted_param1_samples <- numeric(0)
           accepted_param2_samples <- numeric(0)
           
           theta_current_sample_abc <- theta_full_template 
           for (sim_idx in 1:N_abc_sims) {
-            # if (sim_idx %% (N_abc_sims/100) == 0) setTxtProgressBar(pb_abc, sim_idx) # Commented out
 
             p1_sampled <- runif(1, priors_list[[abc_param_names[1]]][1], priors_list[[abc_param_names[1]]][2])
             p2_sampled <- runif(1, priors_list[[abc_param_names[2]]][1], priors_list[[abc_param_names[2]]][2])
@@ -1029,7 +1071,6 @@ if (is.na(SELECTED_BEST_MODEL_NAME) || !(SELECTED_BEST_MODEL_NAME %in% names(the
               accepted_param2_samples <- c(accepted_param2_samples, p2_sampled)
             }
           }
-          # close(pb_abc); # Commented out
           cat("\nNumber of accepted samples:", length(accepted_param1_samples), "\n")
 
           if (length(accepted_param1_samples) < 20) { 
@@ -1103,7 +1144,6 @@ if (is.na(SELECTED_BEST_MODEL_NAME) || !(SELECTED_BEST_MODEL_NAME %in% names(the
                     plot.caption = element_text(hjust=0, size=9, face="italic"))
             print(plot_marginal2)
             
-            # Explanation text remains the same
             cat("\n5. Explanation of ABC Results (for model '", SELECTED_BEST_MODEL_NAME, "'):\n", sep="")
             cat("The Approximate Bayesian Computation (ABC) was performed for parameters '", abc_param_names[1], "' and '", abc_param_names[2], 
                 "'. These were chosen as they had the largest absolute Maximum Likelihood Estimate (MLE) values from Task 2.1.\n", sep="")
